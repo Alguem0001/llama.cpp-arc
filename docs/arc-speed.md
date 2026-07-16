@@ -37,7 +37,20 @@ Optional env vars (Vulkan backend):
 | `GGML_VK_DISABLE_COOPMAT=1` | A/B if coopmat is slower on your driver |
 | `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` | A/B int-dot path |
 | `GGML_VK_ARC_FA_LEGACY=1` | **This fork:** force upstream Intel FA tuning (subgroups off) |
+| `GGML_VK_ARC_MMVQ_WG=large\|subgroup` | **This fork:** force mmvq workgroup size |
+| `GGML_VK_FORCE_MMVQ=1` / `GGML_VK_DISABLE_MMVQ=1` | Force / disable mmvq |
 | `GGML_VK_VISIBLE_DEVICES=0` | Force first Vulkan device |
+
+### Measured on Arc B570 (2026-07-16, build 1359ad996)
+
+**Ternary-Bonsai 1.7B Q2_0** · `-ngl 99 -fa on` · 3 reps:
+
+| Mode | pp512 | tg128 |
+|------|------:|------:|
+| Xe2 FA (default) | 6062 t/s | **244 t/s** |
+| Legacy FA | **6371 t/s** | 232 t/s |
+
+→ Xe2 FA ≈ **+5% TG**, ≈ **−5% PP**. See `benches/arc-b570/RESULTS.md`.
 
 ### 2. Quant choice
 
@@ -125,10 +138,11 @@ Record **pp512** and **tg128** (or tg64) with 3 reps.
 
 - [x] Arc docs + build/bench scripts  
 - [x] Xe2 flash-attn tuning experiment + env rollback  
-- [ ] Mul-mat / mmvq workgroup heuristics for Xe2 (next)  
-- [ ] Optional SYCL dual-build script when oneAPI present  
-- [ ] Draft-model speculative preset for Bonsai sizes  
-- [ ] Capture `llama-bench` baseline JSON under `benches/arc-b570/`
+- [x] Mul-mat / mmvq workgroup heuristics for Xe2 + `GGML_VK_ARC_MMVQ_WG`  
+- [x] Capture `llama-bench` under `benches/arc-b570/`  
+- [x] Draft-model speculative UI in Bansai / LlamaCpp launchers (`-md`, `--draft-max`)  
+- [ ] Optional SYCL dual-build when oneAPI Base Toolkit installed  
+- [ ] Promote winning patches to `Alguem0001/llama.cpp` master
 
 ## Relation to other repos
 

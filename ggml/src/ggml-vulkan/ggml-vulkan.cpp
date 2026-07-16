@@ -7477,23 +7477,40 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    // ARC-SPEED: optional force — GGML_VK_ARC_MMVQ_WG=large|subgroup
+    const char * arc_mmvq_wg = getenv("GGML_VK_ARC_MMVQ_WG");
+    const bool force_large_wg = arc_mmvq_wg && (strcmp(arc_mmvq_wg, "large") == 0 || strcmp(arc_mmvq_wg, "LARGE") == 0);
+    const bool force_sub_wg   = arc_mmvq_wg && (strcmp(arc_mmvq_wg, "subgroup") == 0 || strcmp(arc_mmvq_wg, "SUBGROUP") == 0);
+
+    if (force_large_wg) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    } else if (force_sub_wg) {
+        dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    } else if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
+        // ARC-SPEED: Xe2 (SIMD16) benefits from LARGE more often on decode-heavy shapes.
+        const bool is_xe2 = ctx->device->architecture == INTEL_XE2;
+        const uint32_t m_large_limit = is_xe2 ? 16384u : 8192u;
+        const uint32_t m_q6_limit    = is_xe2 ? 8192u  : 4096u;
         if (a_type == GGML_TYPE_Q6_K) {
-            if (m < 4096 && k >= 1024) {
+            if (m < m_q6_limit && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         } else {
-            if (m <= 8192 && k >= 1024) {
+            if (m <= m_large_limit && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+        }
+        // Xe2 + Q1_0 / Q2_0 (Bonsai family): prefer LARGE for bandwidth-bound decode (m==1)
+        if (is_xe2 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
-        if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+        if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && !force_large_wg) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
@@ -7640,20 +7657,31 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
             return nullptr;
     }
 
-    // heuristic to choose workgroup size
+    // heuristic to choose workgroup size (mul_mat_vec id path)
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    const char * arc_mmvq_wg_id = getenv("GGML_VK_ARC_MMVQ_WG");
+    if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "large") == 0 || strcmp(arc_mmvq_wg_id, "LARGE") == 0)) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    } else if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "subgroup") == 0 || strcmp(arc_mmvq_wg_id, "SUBGROUP") == 0)) {
+        dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    } else if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
-        // q6_k seems to prefer small workgroup size even for "medium" values of M.
+        // ARC-SPEED: Xe2 prefers LARGE more often.
+        const bool is_xe2 = ctx->device->architecture == INTEL_XE2;
+        const uint32_t m_large_limit = is_xe2 ? 16384u : 8192u;
+        const uint32_t m_q6_limit    = is_xe2 ? 8192u  : 4096u;
         if (a_type == GGML_TYPE_Q6_K) {
-            if (m < 4096 && k >= 1024) {
+            if (m < m_q6_limit && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         } else {
-            if (m <= 8192 && k >= 1024) {
+            if (m <= m_large_limit && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
+        }
+        if (is_xe2 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
+            dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
     }
 
