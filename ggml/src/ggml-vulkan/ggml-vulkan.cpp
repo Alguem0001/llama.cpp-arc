@@ -745,6 +745,10 @@ struct vk_device_struct {
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
 
+    // ARC-SPEED: Battlemage B570/Xe2 optimized kernel profile (FA + mmvq + warptiles)
+    // Toggle: GGML_VK_B570_KERNEL=0|1|off|on  (default ON when architecture==INTEL_XE2)
+    bool b570_kernel {};
+
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
@@ -3430,22 +3434,40 @@ struct vk_fa_tuning_params {
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16);
 
+// B570 / Xe2 kernel profile — default ON for INTEL_XE2; override with GGML_VK_B570_KERNEL=0|1
+static bool ggml_vk_b570_kernel_from_env(vk_device_architecture arch) {
+    const char * e = getenv("GGML_VK_B570_KERNEL");
+    if (e != nullptr) {
+        if (e[0] == '0' || strcmp(e, "off") == 0 || strcmp(e, "OFF") == 0 ||
+            strcmp(e, "normal") == 0 || strcmp(e, "NORMAL") == 0) {
+            return false;
+        }
+        if (e[0] == '1' || strcmp(e, "on") == 0 || strcmp(e, "ON") == 0 ||
+            strcmp(e, "opt") == 0 || strcmp(e, "OPT") == 0) {
+            return true;
+        }
+    }
+    // Legacy env still forces upstream FA path (implies no B570 kernel for FA)
+    if (getenv("GGML_VK_ARC_FA_LEGACY") != nullptr) {
+        return false;
+    }
+    return arch == INTEL_XE2;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
     result.path = FA_SCALAR;
+    const bool b570 = device->b570_kernel;
 
     if (device->vendor_id == VK_VENDOR_ID_INTEL) {
-        // ARC-SPEED (Alguem0001/llama.cpp-arc-speed):
-        // Xe2 (Battlemage B570/B580) is SIMD16 — upstream disables subgroups for all Intel
-        // because Xe1/Gen had bad performance when forcing subgroup sizes. On Xe2, try
-        // enabling subgroup-aware FA (override with GGML_VK_ARC_FA_LEGACY=1).
-        const bool arc_fa_legacy = getenv("GGML_VK_ARC_FA_LEGACY") != nullptr;
-        if (!arc_fa_legacy && device->architecture == INTEL_XE2) {
-            result.subgroup_size = device->subgroup_size >= 16 ? 16 : device->subgroup_size;
+        // Upstream: disable subgroups on all Intel (Xe1 history).
+        // B570 v2: on TG (n_rows==1) enable SIMD16 subgroups (measured +5% TG on 1.7B);
+        // on PP keep upstream (subgroups off) to protect prompt speed.
+        if (b570 && n_rows == 1) {
+            result.subgroup_size = 16;
             result.disable_subgroups = false;
         } else {
-            // Xe1 / Gen / legacy: disable subgroup use due to performance issues
             result.subgroup_size = 32;
             result.disable_subgroups = true;
         }
@@ -3467,18 +3489,20 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     } else {
         result.workgroup_size = result.subgroup_size * 4;
     }
+    // B570 TG: 16*4 = 64 threads
+    if (b570 && n_rows == 1 && !result.disable_subgroups) {
+        result.workgroup_size = 64;
+    }
 
     const uint32_t D = hsk | hsv;
 
-    // ARC-SPEED: on Xe2 allow larger block_rows (better occupancy) unless legacy FA mode
-    const bool intel_reduce_rows =
-        device->vendor_id == VK_VENDOR_ID_INTEL &&
-        (device->architecture != INTEL_XE2 || getenv("GGML_VK_ARC_FA_LEGACY") != nullptr);
+    // Upstream always reduces block_rows on Intel
+    const bool intel_reduce_rows = device->vendor_id == VK_VENDOR_ID_INTEL;
     const bool reduce_block_rows = D & 8 || n_kv < 1024 || intel_reduce_rows;
 
     if (n_rows == 1) {
         result.block_rows = 1;
-        result.block_cols = 64;
+        result.block_cols = 64; // keep 64 — Bc=128 regressed on B570
     } else {
         // row_split 1 means higher register use per row, so block size has to be adjusted
         if (result.row_split == 1) {
@@ -3986,6 +4010,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_warptile_mmq = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, tm_l, tn_l, tk_l, subgroup_size_8 };
         m_warptile_mmq = { 128,              64,  64, 32, subgroup_size_8,     32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
         s_warptile_mmq = { subgroup_size_32, 32,  32, 32, s_warptile_wm,       32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+
+        // B570 v2: only deepen BK on small MMQ tile (more K reuse) without inflating threads
+        // (full 128-thread s_warptile regressed TG ~11% in v1).
+        if (device->b570_kernel) {
+            s_warptile_mmq = { subgroup_size_32, 32, 32, 64, s_warptile_wm, 32, 2, tm_s, tn_s, tk_s, subgroup_size_8 };
+        }
 
         // Integer MMQ has a smaller shared memory profile, but heavier register use
         l_warptile_mmq_int = { 128,             128, 128, 32, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
@@ -6744,6 +6774,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
+        device->b570_kernel = ggml_vk_b570_kernel_from_env(device->architecture);
+        // Do NOT force mmvq_mode=1 — that regressed TG in B570 v1 benches.
+
+        std::cerr << "ggml_vulkan: B570 optimized kernel: "
+                  << (device->b570_kernel ? "ON (v2)" : "OFF (normal)")
+                  << "  [toggle: GGML_VK_B570_KERNEL=0|1]" << std::endl;
+
         return device;
     }
 
@@ -7477,10 +7514,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    // ARC-SPEED: optional force — GGML_VK_ARC_MMVQ_WG=large|subgroup
+    // optional force — GGML_VK_ARC_MMVQ_WG=large|subgroup
     const char * arc_mmvq_wg = getenv("GGML_VK_ARC_MMVQ_WG");
     const bool force_large_wg = arc_mmvq_wg && (strcmp(arc_mmvq_wg, "large") == 0 || strcmp(arc_mmvq_wg, "LARGE") == 0);
     const bool force_sub_wg   = arc_mmvq_wg && (strcmp(arc_mmvq_wg, "subgroup") == 0 || strcmp(arc_mmvq_wg, "SUBGROUP") == 0);
+    const bool b570 = ctx->device->b570_kernel;
 
     if (force_large_wg) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
@@ -7490,26 +7528,26 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
-        // ARC-SPEED: Xe2 (SIMD16) benefits from LARGE more often on decode-heavy shapes.
-        const bool is_xe2 = ctx->device->architecture == INTEL_XE2;
-        const uint32_t m_large_limit = is_xe2 ? 16384u : 8192u;
-        const uint32_t m_q6_limit    = is_xe2 ? 8192u  : 4096u;
+        // B570 v2: slightly higher m threshold for LARGE (more EU occupancy on Xe2)
+        const uint32_t m_lim = b570 ? 12288u : 8192u;
+        const uint32_t m_q6  = b570 ? 6144u  : 4096u;
         if (a_type == GGML_TYPE_Q6_K) {
-            if (m < m_q6_limit && k >= 1024) {
+            if (m < m_q6 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         } else {
-            if (m <= m_large_limit && k >= 1024) {
+            if (m <= m_lim && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
-        // Xe2 + Q1_0 / Q2_0 (Bonsai family): prefer LARGE for bandwidth-bound decode (m==1)
-        if (is_xe2 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
+        // Bonsai quants: always LARGE on decode
+        if (b570 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
             dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
+        // Upstream forces SUBGROUP on all Intel (keep that; LARGE on Q8_1 regressed)
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && !force_large_wg) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
@@ -7660,6 +7698,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     // heuristic to choose workgroup size (mul_mat_vec id path)
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     const char * arc_mmvq_wg_id = getenv("GGML_VK_ARC_MMVQ_WG");
+    const bool b570_id = ctx->device->b570_kernel;
     if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "large") == 0 || strcmp(arc_mmvq_wg_id, "LARGE") == 0)) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     } else if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "subgroup") == 0 || strcmp(arc_mmvq_wg_id, "SUBGROUP") == 0)) {
@@ -7667,21 +7706,16 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     } else if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
-        // ARC-SPEED: Xe2 prefers LARGE more often.
-        const bool is_xe2 = ctx->device->architecture == INTEL_XE2;
-        const uint32_t m_large_limit = is_xe2 ? 16384u : 8192u;
-        const uint32_t m_q6_limit    = is_xe2 ? 8192u  : 4096u;
+        const uint32_t m_lim = b570_id ? 12288u : 8192u;
+        const uint32_t m_q6  = b570_id ? 6144u  : 4096u;
         if (a_type == GGML_TYPE_Q6_K) {
-            if (m < m_q6_limit && k >= 1024) {
+            if (m < m_q6 && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         } else {
-            if (m <= m_large_limit && k >= 1024) {
+            if (m <= m_lim && k >= 1024) {
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
-        }
-        if (is_xe2 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
-            dmmv_wg = DMMV_WG_SIZE_LARGE;
         }
     }
 

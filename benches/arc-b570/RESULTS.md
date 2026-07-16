@@ -1,6 +1,38 @@
 # Arc B570 — llama-bench results
 
-**Build:** `1359ad996` (arc-speed) · **Device:** Intel Arc B570 · Vulkan · `-ngl 99 -fa on`
+**Device:** Intel Arc B570 · Vulkan · `-ngl 99 -fa on`
+
+## B570 optimized kernel vs normal (main result)
+
+Toggle: `GGML_VK_B570_KERNEL=0` (normal/upstream) · `=1` (B570 v2 profile).  
+Default on Xe2: **ON**.
+
+### Profile (v2)
+
+| Piece | Normal | B570 v2 |
+|-------|--------|---------|
+| FA TG (`n_rows==1`) | subgroups off, sg=32 | **subgroups on, sg=16, wg=64** |
+| FA PP | subgroups off | same as normal |
+| mmvq Q1_0/Q2_0 decode | default Intel | **force LARGE WG** |
+| small MMQ tile BK | 32 | **64** (deeper K) |
+| force `mmvq_mode` | no | no (v1 force hurt TG) |
+
+### Numbers (build with B570 kernel)
+
+| Model | Mode | pp512 | tg128 | Δ TG |
+|-------|------|------:|------:|-----:|
+| 1.7B Q2_0 | Normal | 6303 | 226.5 | — |
+| 1.7B Q2_0 | **B570 v2** | **6319** | **229.2** | **+1.2%** |
+| 27B Q1_0 | Normal | 469 | 36.0 | — |
+| 27B Q1_0 | B570 v2 | 466 | 35.9 | ~0% |
+
+**v1** (aggressive warptile 128-thread + force mmvq + Bc=128) **regressed** 1.7B TG 230→205 (−11%) — discarded.
+
+**Conclusion:** B570 v2 is a small TG win on 1.7B and neutral on 27B Q1_0 (memory-bound). Keep default ON for Xe2.
+
+---
+
+**Earlier builds** below (FA-only A/B, SYCL).
 
 ## Ternary-Bonsai 1.7B Q2_0 · pp512 / tg128 · 3 reps
 
