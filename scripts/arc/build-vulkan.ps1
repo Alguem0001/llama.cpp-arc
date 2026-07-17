@@ -36,9 +36,16 @@ if (-not (Test-Path (Join-Path $bin "llama-server.exe"))) {
     $bin = Join-Path $Root "$BuildDir\bin\Release"
 }
 
+# Mirror into build\bin so BonsaiWinUI / BonsaiLauncher / configs (LlamaBin) stay current
+$deploy = Join-Path $Root "build\bin"
+if (-not (Test-Path $deploy)) { New-Item -ItemType Directory -Path $deploy -Force | Out-Null }
+Copy-Item (Join-Path $bin "*") $deploy -Force -ErrorAction SilentlyContinue
+Write-Host "Synced → $deploy" -ForegroundColor DarkGray
+
 Write-Host ""
 Write-Host "OK. Binaries:" -ForegroundColor Green
 Get-ChildItem $bin -Filter "llama-*.exe" -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.FullName)" }
 Write-Host ""
 Write-Host "Quick list devices:" -ForegroundColor Cyan
 Write-Host "  & `"$bin\llama-cli.exe`" --list-devices"
+Write-Host "WebUI: start llama-server.exe (embedded UI) → http://127.0.0.1:8080/"

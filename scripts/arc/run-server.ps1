@@ -7,30 +7,31 @@ param(
     [int]$Port = 8080,
     [int]$Ctx = 8192,
     [int]$Ngl = 99,
-    [switch]$Tools,
-    [switch]$LegacyFa
+    [switch]$Tools
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 
 if (-not $BinDir) {
+    # Prefer deploy folder used by WinUI/Launcher; fall back to build-arc
     foreach ($c in @(
-        (Join-Path $Root "build-arc\bin"),
-        (Join-Path $Root "build-arc\bin\Release"),
         (Join-Path $Root "build\bin"),
-        (Join-Path $Root "build\bin\Release")
+        (Join-Path $Root "build-arc\bin"),
+        (Join-Path $Root "build\bin\Release"),
+        (Join-Path $Root "build-arc\bin\Release")
     )) {
         if (Test-Path (Join-Path $c "llama-server.exe")) { $BinDir = $c; break }
     }
 }
 if (-not $BinDir) { throw "llama-server.exe not found" }
 
-if ($LegacyFa) { $env:GGML_VK_ARC_FA_LEGACY = "1" }
-else { Remove-Item Env:GGML_VK_ARC_FA_LEGACY -ErrorAction SilentlyContinue }
-
-# Persistent shader cache helps after first run on Windows
-$env:GGML_VK_FORCE_MAX_ALLOCATION_SIZE = $env:GGML_VK_FORCE_MAX_ALLOCATION_SIZE
+# Clear any leftover env from old multi-mode kernels (v4-only now)
+Remove-Item Env:GGML_VK_B570_KERNEL -ErrorAction SilentlyContinue
+Remove-Item Env:GGML_VK_B570_MMVQ_VEC -ErrorAction SilentlyContinue
+Remove-Item Env:GGML_VK_B570_FUSE_RMSNORM_MUL -ErrorAction SilentlyContinue
+Remove-Item Env:GGML_VK_B570_MMVQ_XL -ErrorAction SilentlyContinue
+Remove-Item Env:GGML_VK_ARC_FA_LEGACY -ErrorAction SilentlyContinue
 
 $exe = Join-Path $BinDir "llama-server.exe"
 $args = @(
