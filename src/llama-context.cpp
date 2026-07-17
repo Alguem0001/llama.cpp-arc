@@ -4363,18 +4363,40 @@ bool llama_context::dspark_markov_resample(
         return false;
     }
 
+    // Decode may still be in flight — must sync before reading logits tensor
+    // state (host copy and/or device buffer). Critical for Vulkan/XPU where
+    // t_logits->data is often null until the graph has completed.
+    synchronize();
+
     const ggml_tensor * t_logits = gf_res_prev->get_logits();
     const int64_t n_vocab = model.vocab.n_tokens();
-    if (t_logits == nullptr || t_logits->type != GGML_TYPE_F32 || t_logits->data == nullptr ||
+    if (t_logits == nullptr || t_logits->type != GGML_TYPE_F32 ||
             t_logits->ne[0] != n_vocab || t_logits->ne[1] < (int64_t) n_rows ||
             head_a->ne[0] != head_b->ne[0] || head_a->ne[1] != head_b->ne[1] ||
             head_a->ne[1] != n_vocab) {
         return false;
     }
 
+    // Match types Vulkan/CUDA/Metal mul_mat + get_rows actually support for weights.
     const auto supported_head_type = [](ggml_type type) {
-        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
-               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
+        switch (type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return true;
+            default:
+                return false;
+        }
     };
     if (!supported_head_type(head_a->type) || !supported_head_type(head_b->type)) {
         return false;
@@ -4398,15 +4420,27 @@ bool llama_context::dspark_markov_resample(
         }
     }
 
-    // The decode graph is asynchronous. Synchronize it once before the
-    // dedicated scheduler reads its logits output tensor.
-    synchronize();
+    // Host logits are already materialised by the decode path (async get + sync
+    // above). Using them as graph inputs is the portable path for Vulkan/XPU:
+    // weights stay on GPU, GEMV+argmax run on-device, only base logits H2D
+    // (~n_rows * n_vocab * 4 B, ~4 MB for Bonsai block_size=4).
+    const float * host_logits = get_logits();
+    if (host_logits == nullptr) {
+        return false;
+    }
 
-    // Build one graph covering rows [k0, k0 + n_chain). Each step consumes the
-    // previous step's GPU argmax tensor as the row id for head_a, so the
-    // sequential Markov dependency remains exact while Metal executes the
-    // whole chain in one scheduler submission.
-    const auto resample_chain = [&](uint32_t k0, uint32_t n_chain, llama_token tok0) -> bool {
+    // Device-alias path (Metal original): reuse t_logits buffer without H2D of
+    // base rows. Prefer when data/buffer is valid; fall back to upload.
+    const bool can_alias = t_logits->buffer != nullptr && t_logits->data != nullptr
+        && getenv("DSPARK_MARKOV_FORCE_UPLOAD") == nullptr;
+
+    // One position at a time is the most portable (Vulkan + quantized heads).
+    // Full chain fusion can fail op-support / backend placement on some stacks.
+    // DSPARK_MARKOV_CHAIN=1 restores the fused multi-step graph (Metal-style).
+    const bool want_chain = getenv("DSPARK_MARKOV_CHAIN") != nullptr
+        && getenv("DSPARK_MARKOV_PER_STEP") == nullptr;
+
+    const auto run_one = [&](uint32_t k, llama_token tok0, bool use_alias) -> bool {
         ggml_init_params params = {
             /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
             /*.mem_buffer =*/ nullptr,
@@ -4420,30 +4454,23 @@ bool llama_context::dspark_markov_resample(
         ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
         ggml_set_input(ids);
 
-        // Do not use ggml_view_1d on t_logits: its parent edge would recursively
-        // pull the completed decode graph into this tiny graph. Each base tensor
-        // is a detached, read-only alias of one already-computed logits row.
-        std::vector<ggml_tensor *> sampled_rows;
-        sampled_rows.reserve(n_chain);
-
-        ggml_tensor * prev_ids = ids;
-        for (uint32_t k = k0; k < k0 + n_chain; ++k) {
-            ggml_tensor * base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+        ggml_tensor * base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+        if (use_alias) {
+            // Detached alias of one logits row — do NOT view() into the decode graph.
             base->buffer = t_logits->buffer;
-            base->data = (char *) t_logits->data + (size_t) k * (size_t) n_vocab * sizeof(float);
-
-            ggml_tensor * emb = ggml_get_rows(ctx.get(), const_cast<ggml_tensor *>(head_a), prev_ids);
-            ggml_tensor * bias = ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(head_b), emb);
-            ggml_tensor * logits = ggml_add(ctx.get(), base, bias);
-            ggml_tensor * sampled = ggml_argmax(ctx.get(), logits);
-
-            ggml_set_output(sampled);
-            sampled_rows.push_back(sampled);
-            prev_ids = sampled;
+            base->data   = (char *) t_logits->data + (size_t) k * (size_t) n_vocab * sizeof(float);
+        } else {
+            ggml_set_input(base);
         }
 
+        ggml_tensor * emb     = ggml_get_rows(ctx.get(), const_cast<ggml_tensor *>(head_a), ids);
+        ggml_tensor * bias    = ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(head_b), emb);
+        ggml_tensor * logits  = ggml_add(ctx.get(), base, bias);
+        ggml_tensor * sampled = ggml_argmax(ctx.get(), logits);
+        ggml_set_output(sampled);
+
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
-        ggml_build_forward_expand(gf, sampled_rows.back());
+        ggml_build_forward_expand(gf, sampled);
 
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             if (!ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i))) {
@@ -4456,50 +4483,107 @@ bool llama_context::dspark_markov_resample(
             return false;
         }
 
-        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), ids);
-        ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), sampled_rows.back());
-        if (ids_backend == nullptr || out_backend == nullptr ||
-                ggml_backend_get_device(out_backend) != dev) {
+        ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), sampled);
+        if (out_backend == nullptr) {
             return false;
         }
 
         const int32_t id = (int32_t) tok0;
         ggml_backend_tensor_set(ids, &id, 0, sizeof(id));
+        if (!use_alias) {
+            ggml_backend_tensor_set(base, host_logits + (size_t) k * (size_t) n_vocab,
+                                    0, (size_t) n_vocab * sizeof(float));
+        }
 
-        const ggml_status status = ggml_backend_sched_graph_compute(dspark_markov_sched.get(), gf);
-        if (status != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(dspark_markov_sched.get(), gf) != GGML_STATUS_SUCCESS) {
             return false;
         }
 
-        // One scheduler synchronization covers the entire sequential chain.
-        for (uint32_t k = 0; k < n_chain; ++k) {
-            int32_t sampled_id = -1;
-            ggml_backend_tensor_get(sampled_rows[k], &sampled_id, 0, sizeof(sampled_id));
-            if (sampled_id < 0 || sampled_id >= n_vocab) {
-                return false;
-            }
-
-            result[k0 + k] = (llama_token) sampled_id;
+        int32_t sampled_id = -1;
+        ggml_backend_tensor_get(sampled, &sampled_id, 0, sizeof(sampled_id));
+        if (sampled_id < 0 || sampled_id >= n_vocab) {
+            return false;
         }
-
+        result[k] = (llama_token) sampled_id;
         return true;
     };
 
-    // A/B toggle: emulate the pre-fusion behavior — one graph build, scheduler
-    // submission, synchronization, and host readback per draft step, with the
-    // sampled token fed back through the host between steps.
-    if (getenv("DSPARK_MARKOV_PER_STEP") != nullptr) {
-        llama_token tok = prev_token;
-        for (uint32_t k = 0; k < n_rows; ++k) {
-            if (!resample_chain(k, 1, tok)) {
-                return false;
+    // Optional fused chain (Metal-style) — try once, then fall back per-step.
+    if (want_chain && can_alias) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (ctx) {
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+            ggml_set_input(ids);
+            std::vector<ggml_tensor *> sampled_rows;
+            sampled_rows.reserve(n_rows);
+            ggml_tensor * prev_ids = ids;
+            bool chain_ok = true;
+            for (uint32_t k = 0; k < n_rows; ++k) {
+                ggml_tensor * base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+                base->buffer = t_logits->buffer;
+                base->data   = (char *) t_logits->data + (size_t) k * (size_t) n_vocab * sizeof(float);
+                ggml_tensor * emb     = ggml_get_rows(ctx.get(), const_cast<ggml_tensor *>(head_a), prev_ids);
+                ggml_tensor * bias    = ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(head_b), emb);
+                ggml_tensor * logits  = ggml_add(ctx.get(), base, bias);
+                ggml_tensor * sampled = ggml_argmax(ctx.get(), logits);
+                ggml_set_output(sampled);
+                sampled_rows.push_back(sampled);
+                prev_ids = sampled;
             }
-            tok = result[k];
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
+            ggml_build_forward_expand(gf, sampled_rows.back());
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                if (!ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i))) {
+                    chain_ok = false;
+                    break;
+                }
+            }
+            if (chain_ok) {
+                ggml_backend_sched_reset(dspark_markov_sched.get());
+                if (ggml_backend_sched_alloc_graph(dspark_markov_sched.get(), gf)) {
+                    const int32_t id = (int32_t) prev_token;
+                    ggml_backend_tensor_set(ids, &id, 0, sizeof(id));
+                    if (ggml_backend_sched_graph_compute(dspark_markov_sched.get(), gf) == GGML_STATUS_SUCCESS) {
+                        bool ok = true;
+                        for (uint32_t k = 0; k < n_rows; ++k) {
+                            int32_t sampled_id = -1;
+                            ggml_backend_tensor_get(sampled_rows[k], &sampled_id, 0, sizeof(sampled_id));
+                            if (sampled_id < 0 || sampled_id >= n_vocab) {
+                                ok = false;
+                                break;
+                            }
+                            result[k] = (llama_token) sampled_id;
+                        }
+                        if (ok) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
-        return true;
     }
 
-    return resample_chain(0, n_rows, prev_token);
+    // Portable per-step path: try device-alias, then host-logits upload (Vulkan).
+    llama_token tok = prev_token;
+    for (uint32_t k = 0; k < n_rows; ++k) {
+        bool ok = false;
+        if (can_alias) {
+            ok = run_one(k, tok, /*use_alias=*/ true);
+        }
+        if (!ok) {
+            ok = run_one(k, tok, /*use_alias=*/ false);
+        }
+        if (!ok) {
+            return false;
+        }
+        tok = result[k];
+    }
+    return true;
 }
 
 void llama_set_dspark_ctx(

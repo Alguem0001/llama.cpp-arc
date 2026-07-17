@@ -3248,31 +3248,42 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             }
 #endif
 
-            // Metal path, same contract as the CUDA block above: one
-            // dependency-chain graph for the whole block (each step's GPU
-            // argmax feeds the next step's get_rows), reading the drafter's
-            // still-device-resident logits. Returns false when the head or
-            // backend is unsupported (or DSPARK_MARKOV_CPU=1) -> host path.
-            bool did_metal = false;
+            // Backend-agnostic GPU path (Metal / Vulkan / CUDA via ggml ops).
+            // Same contract as the CUDA kernels: GEMV markov + argmax per block
+            // position. On Vulkan this is critical — host scalar Markov over
+            // ~250k vocab is ~1 t/s. Returns false when head/backend unsupported
+            // (or DSPARK_MARKOV_CPU=1) → host OpenMP path.
+            bool did_gpu = false;
             if (!did_cuda && has_markov) {
                 result.resize((size_t) block_size);
                 if (llama_dspark_markov_resample(ctx_dft, block_size, dp.id_last, result.data())) {
-                    static bool warned_metal_mask = false;
-                    for (int32_t k = 1; k < block_size && !warned_metal_mask; ++k) {
+                    static bool logged_gpu = false;
+                    if (!logged_gpu) {
+                        LOG_INF("%s: device markov resample (ggml GPU / Vulkan|Metal|CUDA) ENABLED\n", __func__);
+                        logged_gpu = true;
+                    }
+                    static bool warned_gpu_mask = false;
+                    for (int32_t k = 1; k < block_size && !warned_gpu_mask; ++k) {
                         if (result[(size_t) (k - 1)] == mask_token_id) {
-                            LOG_WRN("%s: metal markov resample sampled mask_token_id at a chained position\n", __func__);
-                            warned_metal_mask = true;
+                            LOG_WRN("%s: gpu markov resample sampled mask_token_id at a chained position\n", __func__);
+                            warned_gpu_mask = true;
                         }
                     }
-                    did_metal = true;
+                    did_gpu = true;
                 } else {
+                    static bool logged_gpu_fail = false;
+                    if (!logged_gpu_fail) {
+                        LOG_WRN("%s: device markov resample unavailable — using host OpenMP path "
+                                "(set DSPARK_MARKOV_CPU=1 to silence; check head types / backend)\n", __func__);
+                        logged_gpu_fail = true;
+                    }
                     result.clear();
                 }
             }
 
             llama_token prev_token = dp.id_last;
 
-            if (!did_cuda && !did_metal)
+            if (!did_cuda && !did_gpu)
             for (int32_t k = 0; k < block_size; ++k) {
                 // prev_token is the token SAMPLED at step k-1 (assigned from best_id
                 // at the end of this loop), never a draft input id -- that is the
